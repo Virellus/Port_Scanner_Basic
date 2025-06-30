@@ -8,6 +8,32 @@
 #include <fcntl.h>
 #include <sys/select.h>
 #include <errno.h>
+#include <pthread.h>
+
+// Thread-safe structures
+typedef struct {
+    char target_ip[16];
+    int *ports;
+    int num_ports;
+    int thread_id;
+    int *open_count;
+    pthread_mutex_t *print_mutex;
+    pthread_mutex_t *count_mutex;
+} thread_data_t;
+
+typedef struct {
+    char target_ip[16];
+    int start_port;
+    int end_port;
+    int thread_id;
+    int *open_count;
+    pthread_mutex_t *print_mutex;
+    pthread_mutex_t *count_mutex;
+} range_thread_data_t;
+
+// Global variables for threading
+#define MAX_THREADS 20
+#define DEFAULT_THREADS 10
 
 // Function declarations
 void show_menu();
@@ -16,11 +42,14 @@ void scan_port_range();
 void scan_common_ports();
 int test_port(char* ip, int port);
 const char* get_service_name(int port);
+void* thread_scan_ports(void* arg);
+void* thread_scan_range(void* arg);
+int get_thread_count();
 
 int main() {
     int choice;
     
-    printf("=== Advanced Port Scanner ===\n");
+    printf("=== Advanced Multithreaded Port Scanner ===\n");
     
     while (1) {  // Main menu loop
         show_menu();
@@ -63,14 +92,24 @@ int main() {
 
 void show_menu() {
     printf("\n" "================================\n");
-    printf("        PORT SCANNER MENU\n");
+    printf("   MULTITHREADED PORT SCANNER\n");
     printf("================================\n");
     printf("1. Scan single port\n");
-    printf("2. Scan port range\n");
-    printf("3. Scan common ports\n");
+    printf("2. Scan port range (multithreaded)\n");
+    printf("3. Scan common ports (multithreaded)\n");
     printf("4. Network discovery\n");
     printf("5. Exit\n");
     printf("================================\n");
+}
+
+int get_thread_count() {
+    int threads;
+    printf("Enter number of threads (1-%d, default %d): ", MAX_THREADS, DEFAULT_THREADS);
+    if (scanf("%d", &threads) != 1 || threads < 1 || threads > MAX_THREADS) {
+        printf("Using default: %d threads\n", DEFAULT_THREADS);
+        return DEFAULT_THREADS;
+    }
+    return threads;
 }
 
 void scan_single_port() {
@@ -117,7 +156,7 @@ void scan_port_range() {
     int start_port, end_port;
     int open_ports = 0;
     
-    printf("\n--- Port Range Scan ---\n");
+    printf("\n--- Multithreaded Port Range Scan ---\n");
     printf("Enter target IP address: ");
     
     if (scanf("%15s", target_ip) != 1) {
@@ -148,25 +187,56 @@ void scan_port_range() {
         return;
     }
     
-    printf("\nScanning %s ports %d-%d...\n", target_ip, start_port, end_port);
+    int num_threads = get_thread_count();
+    int total_ports = end_port - start_port + 1;
+    int ports_per_thread = total_ports / num_threads;
+    int remaining_ports = total_ports % num_threads;
+    
+    printf("\nScanning %s ports %d-%d using %d threads...\n", 
+           target_ip, start_port, end_port, num_threads);
     printf("Port\tStatus\n");
     printf("----\t------\n");
     
-    // Loop through each port in the range
-    for (int current_port = start_port; current_port <= end_port; current_port++) {
-        int result = test_port(target_ip, current_port);
+    // Initialize threading resources
+    pthread_t threads[MAX_THREADS];
+    range_thread_data_t thread_data[MAX_THREADS];
+    pthread_mutex_t print_mutex = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_t count_mutex = PTHREAD_MUTEX_INITIALIZER;
+    
+    // Create threads
+    int current_start = start_port;
+    for (int i = 0; i < num_threads; i++) {
+        strcpy(thread_data[i].target_ip, target_ip);
+        thread_data[i].start_port = current_start;
+        thread_data[i].end_port = current_start + ports_per_thread - 1;
         
-        if (result == 1) {
-            printf("%d\tOPEN\n", current_port);
-            open_ports++;
-        } else {
-            printf("%d\tCLOSED\n", current_port);
+        // Distribute remaining ports to first few threads
+        if (i < remaining_ports) {
+            thread_data[i].end_port++;
         }
+        
+        thread_data[i].thread_id = i;
+        thread_data[i].open_count = &open_ports;
+        thread_data[i].print_mutex = &print_mutex;
+        thread_data[i].count_mutex = &count_mutex;
+        
+        current_start = thread_data[i].end_port + 1;
+        
+        pthread_create(&threads[i], NULL, thread_scan_range, &thread_data[i]);
     }
+    
+    // Wait for all threads to complete
+    for (int i = 0; i < num_threads; i++) {
+        pthread_join(threads[i], NULL);
+    }
+    
+    // Cleanup
+    pthread_mutex_destroy(&print_mutex);
+    pthread_mutex_destroy(&count_mutex);
     
     // Summary
     printf("\nScan complete!\n");
-    printf("Scanned %d ports, found %d open\n", (end_port - start_port + 1), open_ports);
+    printf("Scanned %d ports, found %d open\n", total_ports, open_ports);
 }
 
 void scan_common_ports() {
@@ -199,7 +269,7 @@ void scan_common_ports() {
     
     int num_ports = sizeof(common_ports) / sizeof(common_ports[0]);
     
-    printf("\n--- Common Ports Scan ---\n");
+    printf("\n--- Multithreaded Common Ports Scan ---\n");
     printf("Enter target IP address: ");
     
     if (scanf("%15s", target_ip) != 1) {
@@ -212,27 +282,113 @@ void scan_common_ports() {
         return;
     }
     
-    printf("\nScanning %s for common ports...\n", target_ip);
+    int num_threads = (num_ports < DEFAULT_THREADS) ? num_ports : DEFAULT_THREADS;
+    int ports_per_thread = num_ports / num_threads;
+    int remaining_ports = num_ports % num_threads;
+    
+    printf("\nScanning %s for common ports using %d threads...\n", target_ip, num_threads);
     printf("Scanning %d important ports...\n\n", num_ports);
     printf("Port\tStatus\tService\n");
     printf("----\t------\t-------\n");
     
-    // Scan each common port
-    for (int i = 0; i < num_ports; i++) {
-        int port = common_ports[i];
-        int result = test_port(target_ip, port);
+    // Initialize threading resources
+    pthread_t threads[MAX_THREADS];
+    thread_data_t thread_data[MAX_THREADS];
+    pthread_mutex_t print_mutex = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_t count_mutex = PTHREAD_MUTEX_INITIALIZER;
+    
+    // Create threads
+    int port_index = 0;
+    for (int i = 0; i < num_threads; i++) {
+        strcpy(thread_data[i].target_ip, target_ip);
         
-        if (result == 1) {
-            printf("%d\tOPEN\t%s\n", port, get_service_name(port));
-            open_ports++;
-        } else {
-            printf("%d\tCLOSED\t%s\n", port, get_service_name(port));
+        int ports_for_this_thread = ports_per_thread;
+        if (i < remaining_ports) {
+            ports_for_this_thread++;
         }
+        
+        thread_data[i].ports = malloc(ports_for_this_thread * sizeof(int));
+        thread_data[i].num_ports = ports_for_this_thread;
+        
+        // Assign ports to this thread
+        for (int j = 0; j < ports_for_this_thread; j++) {
+            thread_data[i].ports[j] = common_ports[port_index++];
+        }
+        
+        thread_data[i].thread_id = i;
+        thread_data[i].open_count = &open_ports;
+        thread_data[i].print_mutex = &print_mutex;
+        thread_data[i].count_mutex = &count_mutex;
+        
+        pthread_create(&threads[i], NULL, thread_scan_ports, &thread_data[i]);
     }
+    
+    // Wait for all threads to complete
+    for (int i = 0; i < num_threads; i++) {
+        pthread_join(threads[i], NULL);
+        free(thread_data[i].ports);
+    }
+    
+    // Cleanup
+    pthread_mutex_destroy(&print_mutex);
+    pthread_mutex_destroy(&count_mutex);
     
     // Summary
     printf("\nCommon ports scan complete!\n");
     printf("Scanned %d ports, found %d open\n", num_ports, open_ports);
+}
+
+void* thread_scan_range(void* arg) {
+    range_thread_data_t* data = (range_thread_data_t*)arg;
+    
+    for (int port = data->start_port; port <= data->end_port; port++) {
+        int result = test_port(data->target_ip, port);
+        
+        // Thread-safe printing
+        pthread_mutex_lock(data->print_mutex);
+        if (result == 1) {
+            printf("%d\tOPEN\n", port);
+            fflush(stdout);
+            
+            // Thread-safe counter increment
+            pthread_mutex_lock(data->count_mutex);
+            (*(data->open_count))++;
+            pthread_mutex_unlock(data->count_mutex);
+        } else {
+            printf("%d\tCLOSED\n", port);
+            fflush(stdout);
+        }
+        pthread_mutex_unlock(data->print_mutex);
+    }
+    
+    return NULL;
+}
+
+void* thread_scan_ports(void* arg) {
+    thread_data_t* data = (thread_data_t*)arg;
+    
+    for (int i = 0; i < data->num_ports; i++) {
+        int port = data->ports[i];
+        int result = test_port(data->target_ip, port);
+        
+        // Thread-safe printing
+        pthread_mutex_lock(data->print_mutex);
+        if (result == 1) {
+            printf("%d\tOPEN\t%s\n", port, get_service_name(port));
+            fflush(stdout);
+            
+            // Thread-safe counter increment
+            pthread_mutex_lock(data->count_mutex);
+            (*(data->open_count))++;
+            pthread_mutex_unlock(data->count_mutex);
+        } else {
+            printf("%d\tCLOSED\t%s\n", port, get_service_name(port));
+            fflush(stdout);
+        }
+        pthread_mutex_unlock(data->print_mutex);
+    }
+    
+    return NULL;
 }
 
 int test_port(char* ip, int port) {
